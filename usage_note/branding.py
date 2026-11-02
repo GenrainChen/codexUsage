@@ -55,10 +55,23 @@ def style_window(window, background, foreground, border):
         window._brand_icon = tk.PhotoImage(master=window, file=str(ASSETS / 'codex-usage-128.png'))
         window.iconphoto(True, window._brand_icon)
 
+    pending_apply = None
+
     def apply(event=None):
+        nonlocal pending_apply
         if event is not None and event.widget is not window:
             return
+        if event is None:
+            pending_apply = None
         native_titlebar(window, background, foreground, border)
 
+    def cancel_pending(event):
+        nonlocal pending_apply
+        if event.widget is window and pending_apply is not None:
+            # Tk deletes the Python command on destroy, but leaves its idle job.
+            window.after_cancel(pending_apply)
+            pending_apply = None
+
     window.bind('<Map>', apply, add='+')
-    window.after_idle(apply)
+    window.bind('<Destroy>', cancel_pending, add='+')
+    pending_apply = window.after_idle(apply)
