@@ -53,7 +53,7 @@ class CacheUiTests(unittest.TestCase):
     def _start_worker(self, *, rebuild=False):
         threads = []
         with patch("usage_note.ui.threading.Thread", side_effect=lambda **kwargs:
-                   SimpleNamespace(start=lambda: threads.append(kwargs["target"]))):
+                   SimpleNamespace(start=lambda: threads.append(kwargs["target"]), join=lambda: None)):
             self.note.refresh(rebuild=rebuild)
         self.assertEqual(len(threads), 1)
         threads[0]()

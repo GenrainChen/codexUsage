@@ -68,6 +68,17 @@ class SummaryCard(tk.Frame):
         self.bind("<Left>", lambda _e: self._key_page(-1))
         self.bind("<Right>", lambda _e: self._key_page(1))
 
+    def destroy(self):
+        super().destroy()
+        # Tk clears children, but these additional references also form cycles
+        # through Child.master. Break them while still on the Tk thread.
+        self.tabs.clear()
+        self.rows.clear()
+        for name in ("prev_button", "page_label", "next_button", "total_caption",
+                     "timezone_label", "total_tokens", "cost_caption", "total_price",
+                     "breakdown", "note"):
+            setattr(self, name, None)
+
     def _bind_swipe(self, widget):
         if not isinstance(widget, tk.Button):
             widget.bind("<ButtonPress-1>", self._swipe_start, add="+")

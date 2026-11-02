@@ -148,6 +148,7 @@ class UsageNote:
         self._results = queue.Queue()
         self._busy = False
         self._closed = False
+        self._worker_thread = None
         self._after_ids = set()
         self._geometry_save_id = None
         self._settings_error = None
@@ -586,9 +587,16 @@ class UsageNote:
                 self._results.put(("final", data, None))
             except Exception as exc:
                 self._results.put(("final", None, str(exc)))
-        # Keep the owner alive until its bounded quota request runs finally and
-        # closes the temporary app-server, even after the Tk window is closed.
-        threading.Thread(target=worker, name="codex-usage-reader", daemon=False).start()
+        # Retain and join the worker on the Tk thread before releasing its UI
+        # owner; its bounded quota request still cleans up the app-server.
+        self._worker_thread = threading.Thread(target=worker, name="codex-usage-reader", daemon=False)
+        self._worker_thread.start()
+
+    def _finish_worker(self):
+        worker = getattr(self, "_worker_thread", None)
+        if worker is not None:
+            worker.join()
+            self._worker_thread = None
 
     def _poll(self):
         try:
@@ -601,6 +609,7 @@ class UsageNote:
                 self.data = data
                 self._render()
             else:
+                self._finish_worker()
                 self._busy = False
                 self.refresh_button.configure(state="normal", text="刷新")
                 if hasattr(self, "rebuild_button"):
@@ -924,3 +933,6 @@ class UsageNote:
             self.root.after_cancel(identifier)
         self._after_ids.clear()
         self.root.destroy()
+        # Remove the window immediately, then wait for the reader to release
+        # self while this main-thread close() still owns all Tk wrappers.
+        self._finish_worker()

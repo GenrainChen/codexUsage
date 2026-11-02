@@ -48,6 +48,13 @@ class UsageCharts(tk.Frame):
         self.detail.pack(fill="x", pady=(1, 8))
         tk.Frame(self, bg=LINE, height=1).pack(fill="x", pady=(0, 8))
 
+    def destroy(self):
+        super().destroy()
+        # Child.master points back to this frame. Release our extra references
+        # so a later worker-thread GC cannot finalize this window's interpreter.
+        self.plots.clear()
+        self.heading = self.detail = None
+
     def set_data(self, points, anchor, mode, tz=BEIJING_TZ, *, recent=False, now=None):
         self.points, self.mode, self.tz = points, mode, tz
         self.recent = recent
