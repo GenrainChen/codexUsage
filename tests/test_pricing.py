@@ -80,6 +80,55 @@ class PriceBookTests(unittest.TestCase):
         self.assertTrue(quote['partial'])
         self.assertEqual(quote['known_usd'], 1.8)
 
+    def test_fast_model_key_applies_codex_multiplier_to_all_known_categories(self):
+        quote = self.book().quote('example [FAST]', {
+            'input': 1_000_000, 'cached': 2_000_000, 'output': 500_000,
+        })
+        self.assertEqual(quote['input_usd'], 5)
+        self.assertEqual(quote['cached_usd'], 1)
+        self.assertEqual(quote['output_usd'], 10)
+        self.assertEqual(quote['total_usd'], 16)
+
+    def test_fast_model_key_applies_multiplier_to_cache_write_price(self):
+        book = self.book()
+        book.set_override('example', 2, 0.2, 8, cache_write=2.5)
+        quote = book.quote('example [FAST]', {
+            'input': 1_000_000, 'cache_write': 200_000,
+            'cached': 1_000_000, 'output': 0,
+        })
+        self.assertEqual(quote['input_usd'], 5.25)
+        self.assertEqual(quote['cache_write_usd'], 1.25)
+        self.assertEqual(quote['cached_usd'], 0.5)
+        self.assertEqual(quote['total_usd'], 5.75)
+
+    def test_ultrafast_applies_eight_times_to_all_categories_and_base_override(self):
+        book = self.book()
+        book.set_override('example', 3, 0.3, 9, cache_write=3.75)
+        quote = book.quote('example [ULTRAFAST]', {
+            'input': 1_000_000, 'cache_write': 200_000,
+            'cached': 2_000_000, 'output': 500_000,
+        })
+        self.assertEqual(quote['pricing_multiplier'], 8)
+        self.assertEqual(quote['input_usd'], 25.2)
+        self.assertEqual(quote['cache_write_usd'], 6)
+        self.assertEqual(quote['cached_usd'], 4.8)
+        self.assertEqual(quote['output_usd'], 36)
+        self.assertEqual(quote['total_usd'], 66)
+        self.assertEqual(quote['source'], '手动设置')
+
+    def test_ultrafast_unknown_model_and_missing_cache_write_price_stay_partial(self):
+        unknown = self.book().quote('example-preview [ULTRAFAST]', {'input': 100})
+        self.assertEqual(unknown['pricing_multiplier'], 8)
+        self.assertIsNone(unknown['rates'])
+        self.assertIsNone(unknown['total_usd'])
+        quote = self.book().quote('example [ULTRAFAST]', {
+            'input': 1_000_000, 'cache_write': 200_000, 'cached': 1_000_000,
+        })
+        self.assertIsNone(quote['total_usd'])
+        self.assertIsNone(quote['input_usd'])
+        self.assertTrue(quote['partial'])
+        self.assertEqual(quote['known_usd'], 14.4)
+
 
 if __name__ == '__main__':
     unittest.main()

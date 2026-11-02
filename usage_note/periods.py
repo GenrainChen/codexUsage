@@ -54,7 +54,20 @@ def merge_models(groups) -> dict:
     return merged
 
 
-def period_models(data: dict, anchor: date, mode: str) -> dict:
+def recent_bounds(mode, *, now=None, tz=BEIJING_TZ):
+    """Return a half-open interval of 24 hours, 7 days or 30 elapsed days."""
+    if mode not in MODES:
+        raise ValueError(f"Unknown period: {mode}")
+    end = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    start = end - timedelta(days={"day": 1, "week": 7, "month": 30}[mode])
+    return start.astimezone(tz), end.astimezone(tz)
+
+
+def period_models(data: dict, anchor: date, mode: str, *, recent=False, now=None, tz=BEIJING_TZ) -> dict:
+    if recent:
+        start, end = (at.astimezone(timezone.utc) for at in recent_bounds(mode, now=now, tz=tz))
+        return merge_models(models for key, models in data.get("instants", {}).items()
+                            if start <= datetime.fromisoformat(key).astimezone(timezone.utc) < end)
     start, end = (d.isoformat() for d in period_bounds(anchor, mode))
     return merge_models(models for day, models in data.get("days", {}).items()
                         if start <= day < end)
@@ -66,12 +79,14 @@ def local_midnight(day: date, tz=BEIJING_TZ) -> datetime:
     return naive.astimezone() if tz is None else naive.replace(tzinfo=tz)
 
 
-def period_buckets(data: dict, anchor: date, mode: str, *, now=None, tz=BEIJING_TZ) -> list[dict]:
+def period_buckets(data: dict, anchor: date, mode: str, *, now=None, tz=BEIJING_TZ, recent=False) -> list[dict]:
     """Fill elapsed local hours/days, including the unfinished current bucket.
 
     Hourly stepping occurs in UTC: spring gaps disappear and fall-back hours
     remain distinct. Future intervals are not represented as measured zeros.
     """
+    if recent:
+        return _recent_buckets(data, mode, now=now, tz=tz)
     start, end = period_bounds(anchor, mode)
     now = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
     result = []
@@ -99,5 +114,28 @@ def period_buckets(data: dict, anchor: date, mode: str, *, now=None, tz=BEIJING_
         result.append({"at": instant.astimezone(tz), "end": until.astimezone(tz),
                        "models": merge_models(by_instant.get(instant, ())),
                        "current": now < until})
+        instant = until
+    return result
+
+
+def _recent_buckets(data, mode, *, now, tz):
+    start, end = (at.astimezone(timezone.utc) for at in recent_bounds(mode, now=now, tz=tz))
+    local_start = start.astimezone(tz)
+    instant = (local_midnight(local_start.date(), tz) if mode == "month" else
+               local_start.replace(minute=0, second=0, microsecond=0)).astimezone(timezone.utc)
+    groups = {}
+    for key, models in data.get("instants", {}).items():
+        at = datetime.fromisoformat(key).astimezone(timezone.utc)
+        if start <= at < end:
+            local = at.astimezone(tz)
+            bucket = (local_midnight(local.date(), tz) if mode == "month" else
+                      local.replace(minute=0, second=0, microsecond=0)).astimezone(timezone.utc)
+            groups.setdefault(bucket, []).append(models)
+    result = []
+    while instant < end:
+        until = (local_midnight(instant.astimezone(tz).date() + timedelta(days=1), tz)
+                 .astimezone(timezone.utc) if mode == "month" else instant + timedelta(hours=1))
+        result.append({"at": max(start, instant).astimezone(tz), "end": min(end, until).astimezone(tz),
+                       "models": merge_models(groups.get(instant, ())), "current": until > end})
         instant = until
     return result

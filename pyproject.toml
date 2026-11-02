@@ -3,7 +3,7 @@ name = "codex-usage-note"
 version = "0.1.0"
 description = "Local Windows sticky note for Codex token usage and list-price estimates"
 requires-python = ">=3.11"
-dependencies = []
+dependencies = ["zstandard==0.25.0"]
 
 [tool.unittest]
 start-directory = "tests"

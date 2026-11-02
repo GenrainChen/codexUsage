@@ -111,20 +111,118 @@ class ReaderTests(unittest.TestCase):
         data = self.reader.scan()
         self.assertEqual(list(data["hours"]), ["2026-09-12T12:00:00+00:00",
                                                "2026-09-12T13:00:00+00:00"])
+        fast = data["hours"]["2026-09-12T12:00:00+00:00"]["model-a [FAST]"]
         row = data["hours"]["2026-09-12T12:00:00+00:00"]["model-a"]
-        self.assertEqual(row, self.row(data))
+        self.assertEqual((fast["input"], fast["cached"], fast["output"],
+                          fast["cache_write"], fast["reasoning"], fast["requests"]),
+                         (40, 60, 10, 20, 4, 1))
         self.assertEqual((row["input"], row["cached"], row["output"],
                           row["cache_write"], row["reasoning"], row["requests"]),
-                         (80, 100, 25, 30, 9, 2))
-        self.assertEqual(row["max_request_input"], 100)
-        self.assertEqual(row["service_tiers"], ["default", "priority"])
-        self.assertEqual(row["reasoning_efforts"], ["high", "medium"])
+                         (40, 40, 15, 10, 5, 1))
+        self.assertEqual(fast["max_request_input"], 100)
+        self.assertEqual(fast["service_tiers"], ["priority"])
+        self.assertEqual(row["service_tiers"], ["default"])
+        self.assertEqual(fast["reasoning_efforts"], ["high"])
+        self.assertEqual(row["reasoning_efforts"], ["medium"])
+        self.assertEqual(fast["context_windows"], [258400])
         self.assertEqual(row["context_windows"], [258400])
         for key in ("input", "cached", "output", "cache_write", "reasoning", "requests"):
             with self.subTest(field=key):
                 daily = sum(row[key] for models in data["days"].values() for row in models.values())
                 hourly = sum(row[key] for models in data["hours"].values() for row in models.values())
                 self.assertEqual(daily, hourly)
+
+    def test_fast_and_standard_tiers_are_separate_model_rows(self):
+        self.write([meta(),
+                    context("model-a", "normal-turn", service_tier="default"),
+                    event(usage(100, 0, 10)),
+                    context("model-a", "fast-turn", service_tier="fast"),
+                    event(usage(180, 0, 25), usage(80, 0, 15),
+                          at="2026-09-12T12:01:00Z")])
+        models = self.reader.scan()["days"]["2026-09-12"]
+        self.assertEqual(set(models), {"model-a", "model-a [FAST]"})
+        self.assertEqual((models["model-a"]["input"], models["model-a"]["output"]), (100, 10))
+        self.assertEqual((models["model-a [FAST]"]["input"], models["model-a [FAST]"]["output"]), (80, 15))
+        self.assertEqual(models["model-a [FAST]"]["service_tiers"], ["fast"])
+
+    def test_thread_settings_applied_records_fast_tier_for_following_usage(self):
+        settings = lambda tier, at: {"timestamp": at, "type": "event_msg", "payload": {
+            "type": "thread_settings_applied", "thread_id": "thread-a",
+            "thread_settings": {"service_tier": tier}}}
+        self.write([meta(), context("model-a", "turn-a"),
+                    settings("default", "2026-09-12T11:59:00Z"),
+                    event(usage(100, 0, 10)),
+                    settings("priority", "2026-09-12T12:00:30Z"),
+                    event(usage(180, 0, 25), usage(80, 0, 15),
+                          at="2026-09-12T12:01:00Z")])
+        models = self.reader.scan()["days"]["2026-09-12"]
+        self.assertEqual(set(models), {"model-a", "model-a [FAST]"})
+        self.assertEqual(models["model-a"]["service_tiers"], ["default"])
+        self.assertEqual(models["model-a [FAST]"]["service_tiers"], ["priority"])
+
+    def test_ultrafast_settings_separate_usage_when_switching_back_to_fast_and_standard(self):
+        settings = lambda tier: {"type": "event_msg", "payload": {
+            "type": "thread_settings_applied", "thread_settings": {"service_tier": tier}}}
+        self.write([meta(), context(service_tier="default"), event(usage(100, 0, 10)),
+                    settings("ultrafast"),
+                    event(usage(180, 0, 25), usage(80, 0, 15), at="2026-09-12T12:01:00Z"),
+                    settings("priority"),
+                    event(usage(240, 0, 30), usage(60, 0, 5), at="2026-09-12T12:02:00Z"),
+                    settings("default"),
+                    event(usage(290, 0, 35), usage(50, 0, 5), at="2026-09-12T12:03:00Z")])
+        data = self.reader.scan()
+        models = data["days"]["2026-09-12"]
+        self.assertEqual(set(models), {"model-a", "model-a [FAST]", "model-a [ULTRAFAST]"})
+        for key, counts in (("model-a", (150, 15)), ("model-a [FAST]", (60, 5)),
+                            ("model-a [ULTRAFAST]", (80, 15))):
+            self.assertEqual((models[key]["input"], models[key]["output"]), counts)
+        self.assertEqual(models["model-a [ULTRAFAST]"]["service_tiers"], ["ultrafast"])
+        self.assertEqual(data["hours"]["2026-09-12T12:00:00+00:00"], models)
+        self.assertIn("model-a [ULTRAFAST]", data["instants"]["2026-09-12T12:01:00+00:00"])
+
+    def test_ultrafast_is_read_from_context_and_token_info_override(self):
+        info_override = event(usage(180, 0, 25), usage(80, 0, 15), at="2026-09-12T12:01:00Z")
+        info_override["payload"]["info"]["service_tier"] = "ultrafast"
+        self.write([meta(), context(service_tier="ultrafast"), event(usage(100, 0, 10)),
+                    context(service_tier="priority"), info_override,
+                    event(usage(240, 0, 30), usage(60, 0, 5), at="2026-09-12T12:02:00Z")])
+        models = self.reader.scan()["days"]["2026-09-12"]
+        self.assertEqual(set(models), {"model-a [FAST]", "model-a [ULTRAFAST]"})
+        self.assertEqual(models["model-a [ULTRAFAST]"]["input"], 180)
+        self.assertEqual(models["model-a [ULTRAFAST]"]["output"], 25)
+        self.assertEqual(models["model-a [FAST]"]["input"], 60)
+
+    def test_later_context_and_partial_settings_preserve_explicit_thread_speed(self):
+        for tier, suffix in (("ultrafast", "ULTRAFAST"), ("priority", "FAST"), ("fast", "FAST")):
+            for source in ("context", "settings"):
+                with self.subTest(tier=tier, source=source):
+                    settings = {"type": "event_msg", "payload": {
+                        "type": "thread_settings_applied", "thread_settings": {"service_tier": tier}}}
+                    partial = {"type": "event_msg", "payload": {
+                        "type": "thread_settings_applied", "thread_settings": {"model": "model-a"}}}
+                    start = ([context(service_tier=tier)] if source == "context" else
+                             [context(), settings])
+                    self.write([meta(), *start, event(usage(100, 0, 10)),
+                                context(turn="next-turn"), partial,
+                                event(usage(180, 0, 25), usage(80, 0, 15),
+                                      at="2026-09-12T12:01:00Z")])
+                    reader = UsageReader(self.home, tz=timezone.utc)
+                    models = reader.scan()["days"]["2026-09-12"]
+                    self.assertEqual(set(models), {f"model-a [{suffix}]"})
+                    self.assertEqual(models[f"model-a [{suffix}]"]["input"], 180)
+                    self.assertEqual(models[f"model-a [{suffix}]"]["output"], 25)
+
+    def test_explicit_default_or_null_clears_inherited_ultrafast(self):
+        for reset in ("default", None):
+            with self.subTest(reset=reset):
+                self.write([meta(), context(service_tier="ultrafast"), event(usage(100, 0, 10)),
+                            context(turn="standard-turn", service_tier=reset),
+                            event(usage(180, 0, 25), usage(80, 0, 15),
+                                  at="2026-09-12T12:01:00Z")])
+                reader = UsageReader(self.home, tz=timezone.utc)
+                models = reader.scan()["days"]["2026-09-12"]
+                self.assertEqual(set(models), {"model-a [ULTRAFAST]", "model-a"})
+                self.assertEqual(models["model-a"]["input"], 80)
 
     def test_local_hour_boundary_handles_half_hour_offsets_and_midnight(self):
         self.reader = UsageReader(self.home, tz=timezone(timedelta(hours=5, minutes=30)))
@@ -375,7 +473,7 @@ class ReaderTests(unittest.TestCase):
     def test_cache_write_is_an_input_subset_and_tier_metadata_is_preserved(self):
         self.write([meta(), context(service_tier="priority", effort="high"),
                     event(usage(300000, 180000, 50, reasoning=20, cache_write=50000))])
-        row = self.row(self.reader.scan())
+        row = self.row(self.reader.scan(), model="model-a [FAST]")
         self.assertEqual((row["input"], row["cached"], row["cache_write"], row["output"]),
                          (120000, 180000, 50000, 50))
         self.assertEqual(row["max_request_input"], 300000)

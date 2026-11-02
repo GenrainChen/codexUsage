@@ -47,6 +47,40 @@ class SummaryTests(unittest.TestCase):
         self.assertEqual(result["known_usd"], 0)
         self.assertTrue(result["fully_priced"])
 
+    def test_fast_rows_use_codex_multiplier_but_keep_distinct_labels(self):
+        result = summarize_day({
+            "known": {"input": 100, "cached": 0, "output": 10},
+            "known [FAST]": {"input": 200, "cached": 0, "output": 20},
+        }, self.prices)
+        rows = {row["model"]: row for row in result["rows"]}
+        self.assertEqual(rows["known"]["label"], "known")
+        self.assertEqual(rows["known [FAST]"]["label"], "known · FAST")
+        self.assertEqual(rows["known [FAST]"]["base_model"], "known")
+        self.assertAlmostEqual(rows["known [FAST]"]["quote"]["total_usd"], .0014)
+
+    def test_ultrafast_summary_and_period_curves_use_same_multiplier_without_scaling_tokens(self):
+        models = {"known": {"input": 100, "output": 10},
+                  "known [FAST]": {"input": 200, "output": 20},
+                  "known [ULTRAFAST]": {"input": 300, "output": 30}}
+        data = {"days": {"2026-09-09": models},
+                "hours": {"2026-09-09T12:00:00+00:00": models},
+                "instants": {"2026-09-09T12:00:00+00:00": models}}
+        now = datetime(2026, 9, 9, 13, tzinfo=timezone.utc)
+        for recent in (False, True):
+            for mode in ("day", "week", "month"):
+                with self.subTest(mode=mode, recent=recent):
+                    summary = summarize_day(period_models(data, now.date(), mode,
+                                                         recent=recent, now=now), self.prices)
+                    points = [summarize_day(bucket["models"], self.prices) for bucket in period_buckets(
+                        data, now.date(), mode, recent=recent, now=now, tz=timezone.utc)]
+                    self.assertEqual(summary["tokens"], 660)
+                    self.assertAlmostEqual(summary["known_usd"], .0084)
+                    self.assertAlmostEqual(sum(p["known_usd"] for p in points), summary["known_usd"])
+                    row = next(row for row in summary["rows"] if row["model"] == "known [ULTRAFAST]")
+                    self.assertEqual(row["label"], "known · ULTRAFAST")
+                    self.assertEqual(row["base_model"], "known")
+                    self.assertAlmostEqual(row["quote"]["total_usd"], .00672)
+
     def test_rate_limit_window_uses_actual_duration(self):
         self.assertEqual(window_label({"window_minutes": 60}), "1 小时")
         self.assertEqual(window_label({"window_minutes": 300}), "5 小时")

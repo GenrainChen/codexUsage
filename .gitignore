@@ -3,3 +3,4 @@ __pycache__/
 *.pyc
 .local/
 dist/
+.codex/*.local.json

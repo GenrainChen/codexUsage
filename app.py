@@ -18,14 +18,20 @@ def main() -> int:
                         default=Path(os.environ.get('CODEX_HOME', Path.home() / '.codex')))
     parser.add_argument('--report', action='store_true', help='输出本地计量摘要 JSON，不开启窗口')
     parser.add_argument('--date', help='北京时间报告日期 YYYY-MM-DD；省略为全部历史')
+    cache_options = parser.add_mutually_exclusive_group()
+    cache_options.add_argument('--rebuild-cache', action='store_true', help='重新读取全部本机用量记录并重建缓存')
+    cache_options.add_argument('--no-cache', action='store_true', help='本次不使用持久历史缓存')
     args = parser.parse_args()
     from usage_note.pricing import PriceBook
     from usage_note.reader import UsageReader
 
-    reader = UsageReader(args.codex_home)
+    reader = UsageReader(args.codex_home, cache_path=(None if args.no_cache else
+                         ROOT / '.local' / 'usage-cache.sqlite3'))
     prices = PriceBook(ROOT / 'prices.json', ROOT / '.local' / 'price-overrides.json')
     if args.report:
-        report = reader.scan()
+        report = reader.scan(rebuild=True) if args.rebuild_cache else reader.scan()
+        report.pop('instants', None)
+        report.pop('output_instants', None)
         report['timezone'] = str(reader.tz)
         if args.date:
             report['days'] = {args.date: report['days'].get(args.date, {})}
@@ -48,7 +54,8 @@ def main() -> int:
     set_app_identity()
     root = tk.Tk()
     root.title('Codex 用量便签')
-    UsageNote(root, reader, prices, ROOT / '.local' / 'settings.json')
+    UsageNote(root, reader, prices, ROOT / '.local' / 'settings.json',
+              initial_rebuild_cache=args.rebuild_cache)
     root.mainloop()
     return 0
 

@@ -97,7 +97,7 @@ class LayoutTests(unittest.TestCase):
     def test_footer_and_disclaimer_survive_normal_and_minimum_size(self):
         footer = self.note.warning_label.master
         disclaimer = next(child for child in descendants(footer)
-                          if isinstance(child, tk.Button) and "非订阅账单" in child.cget("text"))
+                      if isinstance(child, tk.Button) and "API 标准价估算" in child.cget("text"))
         for width, height in ((460, 800), (390, 650)):
             with self.subTest(size=f"{width}x{height}"):
                 self.root.geometry(f"{width}x{height}")
@@ -107,6 +107,8 @@ class LayoutTests(unittest.TestCase):
                 self.assert_fully_visible(footer, self.root)
                 self.assert_fully_visible(self.note.warning_label, self.root)
                 self.assert_fully_visible(disclaimer, self.root)
+                self.assertGreaterEqual(disclaimer.winfo_width(), disclaimer.winfo_reqwidth(),
+                                        "speed multiplier text was horizontally clipped")
                 self.assert_fully_visible(self.note.refresh_button, self.root)
 
     def test_summary_swipes_between_consumption_and_output_without_height_jump(self):

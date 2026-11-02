@@ -1,12 +1,12 @@
 {
-  "updated_at": "2026-09-13",
-  "basis": "standard",
+  "updated_at": "2026-10-23",
+  "basis": "standard+codex-fast-2.5x+codex-ultrafast-8x",
   "notes": [
-    "单位为美元 / 每百万 token；按当前公开 API Standard 短上下文刊例价估算，不是 Codex 订阅账单或实际扣费。",
+    "单位为美元 / 每百万 token；普通模型按当前公开 API Standard 短上下文刊例价估算，Fast / Priority 按基础模型价格的 2.5 倍、Ultrafast 按 8 倍估算，不是 Codex 订阅账单或实际扣费。",
     "输入总量包含缓存读取和缓存写入。普通输入 = 输入总量 - 缓存读取 - 缓存写入；三个输入类别分别计价，不重复相加。",
     "GPT-5.6 及以后模型的缓存写入按普通输入价的 1.25 倍计价；GPT-5.5 及以前没有额外缓存写入费。旧日志缺少写缓存字段时只能按现有记录估算。",
-    "默认不加长上下文倍率。Astra / GPT-5.6 单次请求输入超过 272,000 token 时，官方输入及缓存价格为 2 倍、输出为 1.5 倍；GPT-5.5 文档另有整段 session 的长上下文计价规则。",
-    "默认不加 Fast / Priority 倍率。Astra / GPT-5.6 的 API Fast 价格为对应 Standard 的 2 倍；Batch / Flex 为 0.5 倍。Codex 订阅额度和 credits 的倍率属于另一种计费口径。",
+    "默认不加长上下文倍率。GPT-6 / GPT-5.6 单次请求输入超过 272,000 token 时，官方输入及缓存价格为 2 倍、输出为 1.5 倍；GPT-5.5 文档另有整段 session 的长上下文计价规则。",
+    "速度倍率沿用 Codex 订阅内额度口径：Fast / Priority 为 2.5 倍，Ultrafast 为 8 倍；官方购买 credits / 企业按量付费分别为 2 倍、6 倍。本便签以订阅内倍率作美元展示估算，不代表 API 速度档位价格或实际扣费。来源：https://learn.chatgpt.com/docs/agent-configuration/speed 。长上下文、Batch / Flex 和其他特殊价格不自动调整。",
     "GPT-5.6 Sol 当前公开促销价至少持续到 2026-11-21；历史日期也按本价格表估算，不代表当时的实际单价。",
     "未包含地区处理附加费、工具调用、图像或语音等单独收费；无已核实公开报价的模型保留用量并显示价格未知。"
   ],
@@ -17,6 +17,27 @@
       "output": 50,
       "cache_write": 12.5,
       "source": "https://developers.openai.com/api/docs/models/gpt-6-astra"
+    },
+    "gpt-6.1-sol": {
+      "input": 2,
+      "cached": 0.1,
+      "output": 10,
+      "cache_write": 2.5,
+      "source": "https://developers.openai.com/api/docs/models/gpt-6.1-sol"
+    },
+    "gpt-6-sol": {
+      "input": 2,
+      "cached": 0.2,
+      "output": 10,
+      "cache_write": 2.5,
+      "source": "https://developers.openai.com/api/docs/models/gpt-6-sol"
+    },
+    "gpt-6-luna": {
+      "input": 0.1,
+      "cached": 0.01,
+      "output": 0.5,
+      "cache_write": 0.125,
+      "source": "https://developers.openai.com/api/docs/models/gpt-6-luna"
     },
     "gpt-5.6-sol": {
       "input": 4,

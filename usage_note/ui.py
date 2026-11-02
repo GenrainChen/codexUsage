@@ -15,11 +15,12 @@ from tkinter import messagebox, ttk
 from usage_note.branding import ASSETS, style_window
 from usage_note.account_store import AccountStore
 from usage_note.charts import UsageCharts
-from usage_note.periods import MODES, move_period, period_bounds, period_buckets, period_models
+from usage_note.periods import MODES, move_period, period_bounds, period_buckets, period_models, recent_bounds
 from usage_note.output import period_output
 from usage_note.summary_card import SummaryCard
 from usage_note.quotas import HIDDEN_QUOTA_IDS, quota_groups
 from usage_note.timebase import BEIJING_TZ, now as note_now, today as note_today
+from usage_note.models import base_model, model_label
 
 
 PAPER = "#F7F4EC"
@@ -38,8 +39,9 @@ def summarize_day(models, pricebook):
                   for key in ("input", "cached", "output")}
     rows, unknown, subtotal, cache_write = [], [], 0.0, 0
     complete = True
-    for model, tokens in models.items():
-        quote = pricebook.quote(model, tokens)
+    for model_key, tokens in models.items():
+        model = base_model(model_key)
+        quote = pricebook.quote(model_key, tokens)
         parts = {key: quote.get(key + "_usd") for key in categories}
         known = quote.get("known_usd")
         if known is None:
@@ -48,7 +50,7 @@ def summarize_day(models, pricebook):
         partial = quote.get("total_usd") is None
         complete = complete and not partial
         if partial:
-            unknown.append(model)
+            unknown.append(model_key)
         cache_write += tokens.get("cache_write", 0)
         for key, item in categories.items():
             count = tokens.get(key, 0)
@@ -63,7 +65,8 @@ def summarize_day(models, pricebook):
                     if known_input is None:
                         known_input = max(0, known - sum(parts[k] or 0 for k in ("cached", "output")))
                     item["usd"] += known_input
-        rows.append({"model": model, "tokens": tokens, "quote": quote,
+        rows.append({"model": model_key, "label": model_label(model_key), "base_model": model,
+                     "tokens": tokens, "quote": quote,
                      "known_usd": known, "partial": partial,
                      "total_tokens": sum(tokens.get(key, 0) for key in categories)})
     rows.sort(key=lambda row: (-row["total_tokens"], row["model"]))
@@ -110,10 +113,33 @@ def local_time(value, fmt="%m-%d %H:%M"):
         return "未知时间"
 
 
+def cache_diagnostics(report):
+    """Describe cache work using only report metadata."""
+    path = report.get("cache_path")
+    if not path:
+        return "历史缓存：未启用"
+    state = {"cached": "已载入，正在检查更新", "updated": "已更新",
+             "stale": "未更新，沿用历史缓存"}.get(report.get("cache_status"), "状态未知")
+    stats = report.get("cache_stats") or {}
+    size = stats.get("bytes_read", 0)
+    if size >= 1024 * 1024:
+        amount = f"{size / (1024 * 1024):.1f} MiB"
+    elif size >= 1024:
+        amount = f"{size / 1024:.1f} KiB"
+    else:
+        amount = f"{size} B"
+    return (f"历史缓存：{state}\n路径：{path}\n"
+            f"复用 {stats.get('reused_files', 0):,} 个文件 · "
+            f"增量 {stats.get('appended_files', 0):,} 个 · "
+            f"重读 {stats.get('reread_files', 0):,} 个\n"
+            f"读取 {amount} · 耗时 {stats.get('elapsed_ms', 0):,} ms")
+
+
 class UsageNote:
     """Own UI state; only the worker thread calls the read-only usage scanner."""
 
-    def __init__(self, root: tk.Tk, reader, pricebook, settings_path: Path):
+    def __init__(self, root: tk.Tk, reader, pricebook, settings_path: Path,
+                 *, initial_rebuild_cache: bool = False):
         self.root, self.reader, self.pricebook = root, reader, pricebook
         self.settings_path = Path(settings_path)
         self.data = {"days": {}, "hours": {}, "warnings": []}
@@ -127,6 +153,7 @@ class UsageNote:
         self._settings_error = None
         self._scan_error = None
         self._last_scan = None
+        self._cache_loaded_once = False
         self._selected_model = None
         self._model_rows = []
         self.account_store = AccountStore(self.settings_path.with_name("account-quotas.json"))
@@ -138,6 +165,9 @@ class UsageNote:
         self.period = settings.get("period", "day")
         if self.period not in MODES:
             self.period = "day"
+        self.range_mode = settings.get("range_mode", "calendar")
+        if self.range_mode not in ("calendar", "recent"):
+            self.range_mode = "calendar"
         root.title("Codex 用量便签")
         root.configure(bg=PAPER)
         root.minsize(390, 650)
@@ -155,7 +185,7 @@ class UsageNote:
         root.bind("<Configure>", self._window_configured, add="+")
         self._schedule(80, self._poll)
         self._schedule_auto_refresh()
-        self.refresh()
+        self.refresh(rebuild=initial_rebuild_cache)
 
     def _load_settings(self):
         try:
@@ -195,7 +225,8 @@ class UsageNote:
             temporary = self.settings_path.with_suffix(self.settings_path.suffix + ".tmp")
             temporary.write_text(json.dumps({"geometry": self._normal_geometry,
                                             "topmost": self.topmost.get(),
-                                            "period": self.period}, ensure_ascii=False, indent=2), encoding="utf-8")
+                                            "period": self.period,
+                                            "range_mode": self.range_mode}, ensure_ascii=False, indent=2), encoding="utf-8")
             temporary.replace(self.settings_path)
             return True
         except OSError as exc:
@@ -241,21 +272,32 @@ class UsageNote:
 
         switcher = tk.Frame(page, bg=CARD)
         switcher.pack(fill="x", pady=(12, 0))
+        range_switcher = tk.Frame(switcher, bg=CARD)
+        range_switcher.grid(row=0, column=0, columnspan=3, sticky="ew")
+        self.range_buttons = {}
+        for index, (mode, title) in enumerate((("calendar", "自然"), ("recent", "最近"))):
+            range_switcher.grid_columnconfigure(index, weight=1, uniform="range")
+            button = self._button(range_switcher, title, lambda m=mode: self._set_range_mode(m))
+            button.grid(row=0, column=index, sticky="ew", padx=2, pady=2)
+            self.range_buttons[mode] = button
         self.period_buttons = {}
         for index, (mode, title) in enumerate((("day", "日"), ("week", "周"), ("month", "月"))):
             switcher.grid_columnconfigure(index, weight=1, uniform="period")
             button = self._button(switcher, title, lambda m=mode: self._set_period(m))
-            button.grid(row=0, column=index, sticky="ew", padx=2, pady=2)
+            button.grid(row=1, column=index, sticky="ew", padx=2, pady=2)
             self.period_buttons[mode] = button
         navigation = tk.Frame(page, bg=PAPER)
         navigation.pack(fill="x", pady=(7, 9))
-        self._button(navigation, "‹", lambda: self._move_date(-1), width=1).pack(side="left")
+        self.prev_button = self._button(navigation, "‹", lambda: self._move_date(-1), width=1)
+        self.prev_button.pack(side="left")
         self.date_button = self._button(navigation, "", self._choose_date)
         self.date_button.pack(side="left")
         self.next_button = self._button(navigation, "›", lambda: self._move_date(1), width=1)
         self.next_button.pack(side="left")
         self.today_button = self._button(navigation, "今日", self._today)
         self.today_button.pack(side="right")
+
+        self.range_label = self._label(page, "", 8, MUTED, anchor="w", justify="left")
 
         self.summary_card = SummaryCard(page, self._label, self._button, money)
         self.summary_card.pack(fill="x")
@@ -311,10 +353,14 @@ class UsageNote:
         self.status_label.pack(side="left", fill="x", expand=True)
         self.refresh_button = self._button(status_row, "刷新", self.refresh)
         self.refresh_button.pack(side="right")
+        self.cache_menu = tk.Menu(self.root, tearoff=False)
+        self.cache_menu.add_command(label="重建缓存", command=self._rebuild_cache)
+        self.rebuild_button = self._button(status_row, "⋯", self._show_cache_menu, width=2)
+        self.rebuild_button.pack(side="right", padx=(0, 5))
         self.warning_label = self._label(footer, "", 8, ORANGE, anchor="w", justify="left", cursor="hand2")
         self.warning_label.pack(fill="x")
         self.warning_label.bind("<Button-1>", lambda _e: self._show_warnings())
-        self._button(footer, "API 标准价估算 · 非订阅账单 ⓘ", self._show_info, anchor="w").pack(fill="x")
+        self._button(footer, "API 标准价估算 · FAST 2.5× / ULTRAFAST 8× ⓘ", self._show_info, anchor="w").pack(fill="x")
 
     def _update_scrollbar(self, first, last):
         self.scrollbar.set(first, last)
@@ -338,25 +384,39 @@ class UsageNote:
         self._save_settings()
 
     def _today(self):
-        self.follow_today = True
-        self.selected_date = note_today()
+        if self.range_mode == "calendar":
+            self.follow_today = True
+            self.selected_date = note_today()
         self.canvas.yview_moveto(0)
         self._render()
 
     def _set_period(self, mode):
         self.period = mode
-        self.follow_today = period_bounds(self.selected_date, mode) == period_bounds(note_today(), mode)
+        if self.range_mode == "calendar":
+            self.follow_today = period_bounds(self.selected_date, mode) == period_bounds(note_today(), mode)
+        self.canvas.yview_moveto(0)
+        self._render()
+        self._save_settings()
+
+    def _set_range_mode(self, mode):
+        self.range_mode = mode
+        if mode == "calendar" and self.follow_today:
+            self.selected_date = note_today()
         self.canvas.yview_moveto(0)
         self._render()
         self._save_settings()
 
     def _move_date(self, amount):
+        if self.range_mode == "recent":
+            return
         self.selected_date = min(note_today(), move_period(self.selected_date, self.period, amount))
         self.follow_today = period_bounds(self.selected_date, self.period) == period_bounds(note_today(), self.period)
         self.canvas.yview_moveto(0)
         self._render()
 
     def _choose_date(self):
+        if self.range_mode == "recent":
+            return
         dialog = self._dialog("选择日期", "320x230")
         title = {"day": "查看哪一天？", "week": "选择周内任意一天", "month": "选择月内任意一天"}[self.period]
         self._label(dialog, title, 15, bold=True).pack(anchor="w", padx=20, pady=(18, 12))
@@ -399,7 +459,7 @@ class UsageNote:
         content.pack(fill="both", expand=True)
         self._label(content, "给模型填一张价签", 16, bold=True).pack(anchor="w")
         self._label(content, "美元 / 每百万 token · 保存到本机", 9, MUTED).pack(anchor="w", pady=(5, 15))
-        model_names = sorted({name for day in self.data.get("days", {}).values() for name in day}
+        model_names = sorted({base_model(name) for day in self.data.get("days", {}).values() for name in day}
                              | set(getattr(self.pricebook, "models", {})))
         model_var = tk.StringVar(dialog, value=initial_model or (model_names[0] if model_names else ""))
         self._label(content, "模型名称", 9, MUTED).pack(anchor="w")
@@ -420,7 +480,7 @@ class UsageNote:
         source_label = self._label(content, "", 8, MUTED, wraplength=365, justify="left", anchor="w")
         source_label.pack(fill="x", pady=(8, 0))
         self._label(content, f"内置价表核实于 {getattr(self.pricebook, 'updated_at', '') or '未知日期'}", 8, MUTED).pack(anchor="w", pady=(8, 0))
-        self._label(content, "历史日期也按当前价表估算。\nFast / Priority 与长上下文未计倍率。", 8, MUTED, justify="left").pack(anchor="w", pady=(4, 0))
+        self._label(content, "历史日期也按当前价表估算。\nFast / Priority 按 2.5 倍、Ultrafast 按 8 倍单列估算。", 8, MUTED, justify="left").pack(anchor="w", pady=(4, 0))
         def populate(_event=None):
             quote = self.pricebook.quote(model_var.get().strip(), {})
             rates = quote.get("rates") or {}
@@ -489,43 +549,75 @@ class UsageNote:
                 "account_pages": self.account_store.pages(latest, note_now()),
                 "account_quota_error": self._quota_error}
 
-    def refresh(self):
+    def _rebuild_cache(self):
+        self.refresh(rebuild=True)
+
+    def _show_cache_menu(self):
+        x = self.rebuild_button.winfo_rootx()
+        y = self.rebuild_button.winfo_rooty() + self.rebuild_button.winfo_height()
+        try:
+            self.cache_menu.tk_popup(x, y)
+        finally:
+            self.cache_menu.grab_release()
+
+    def refresh(self, *, rebuild=False):
         if self._busy or self._closed:
             return
         self._busy = True
         self.refresh_button.configure(state="disabled", text="读取中")
+        if hasattr(self, "rebuild_button"):
+            self.rebuild_button.configure(state="disabled")
         self.status_label.configure(text="正在读取本机用量记录…")
+        load_cache = getattr(self.reader, "load_cached", None)
+        show_cached = callable(load_cache) and not getattr(self, "_cache_loaded_once", False)
+        self._cache_loaded_once = True
         def worker():
             try:
-                data = self.reader.scan()
+                if show_cached:
+                    try:
+                        cached = load_cache()
+                    except Exception:
+                        cached = None
+                    if cached is not None and not self._closed:
+                        self._results.put(("cached", cached, None))
+                data = self.reader.scan(rebuild=True) if rebuild else self.reader.scan()
                 data.update(self._read_account_data())
                 data["warnings"] = data.get("warnings", []) + self.account_store.warnings
-                self._results.put((data, None))
+                self._results.put(("final", data, None))
             except Exception as exc:
-                self._results.put((None, str(exc)))
+                self._results.put(("final", None, str(exc)))
         # Keep the owner alive until its bounded quota request runs finally and
         # closes the temporary app-server, even after the Tk window is closed.
         threading.Thread(target=worker, name="codex-usage-reader", daemon=False).start()
 
     def _poll(self):
         try:
-            data, error = self._results.get_nowait()
+            item = self._results.get_nowait()
         except queue.Empty:
             pass
         else:
-            self._busy = False
-            self.refresh_button.configure(state="normal", text="刷新")
-            if error is not None:
-                self.status_label.configure(text=f"读取失败 · {self._next_refresh_at:%H:%M} 自动重试")
-                self.warning_label.configure(text=f"{error[:46]}（点击查看）")
-                self._scan_error = error
-            else:
-                self._scan_error = None
+            kind, data, error = item if len(item) == 3 else ("final", *item)
+            if kind == "cached":
                 self.data = data
-                self._last_scan = note_now()
-                if self.follow_today:
-                    self.selected_date = note_today()
                 self._render()
+            else:
+                self._busy = False
+                self.refresh_button.configure(state="normal", text="刷新")
+                if hasattr(self, "rebuild_button"):
+                    self.rebuild_button.configure(state="normal")
+                if error is not None:
+                    self.warning_label.configure(text=f"{error[:46]}（点击查看）")
+                    self._scan_error = error
+                    self._render_status()
+                else:
+                    self._scan_error = None
+                    self.data = data
+                    stale = data.get("cache_status") == "stale"
+                    if not stale:
+                        self._last_scan = note_now()
+                    if self.follow_today and self.range_mode == "calendar":
+                        self.selected_date = note_today()
+                    self._render()
         self._schedule(100, self._poll)
 
     def _schedule_auto_refresh(self):
@@ -543,7 +635,26 @@ class UsageNote:
         if due:
             self.refresh()
 
+    def _render_status(self):
+        status = self.data.get("cache_status")
+        if self._busy:
+            message = ("历史缓存 · 正在检查更新" if status in ("cached", "stale")
+                       else "正在读取本机用量记录…")
+        elif status == "stale":
+            message = f"历史缓存 · 更新失败 · {self._next_refresh_at:%H:%M} 自动重试"
+        elif self._scan_error:
+            message = f"读取失败 · {self._next_refresh_at:%H:%M} 自动重试"
+        elif self._last_scan:
+            message = f"已刷新 {self._last_scan:%H:%M:%S} · 下次 {self._next_refresh_at:%H:%M}"
+        elif status == "cached":
+            message = "历史缓存"
+        else:
+            return
+        self.status_label.configure(text=message)
+
     def _render(self):
+        instant = note_now()
+        recent = self.range_mode == "recent"
         start, end = period_bounds(self.selected_date, self.period)
         current = (start, end) == period_bounds(note_today(), self.period)
         if self.period == "week":
@@ -558,25 +669,44 @@ class UsageNote:
         self.date_button.configure(text=date_text)
         self.today_button.configure(text={"day": "今日", "week": "本周", "month": "本月"}[self.period])
         self.next_button.configure(state="disabled" if current else "normal")
+        recent_caption = {"day": "最近一天", "week": "最近一周", "month": "最近一个月"}[self.period]
+        self.prev_button.configure(state="disabled" if recent else "normal")
+        self.date_button.configure(state="disabled" if recent else "normal")
+        if recent:
+            rolling_start, rolling_end = recent_bounds(self.period, now=instant, tz=self.reader.tz)
+            self.date_button.configure(text=recent_caption)
+            self.today_button.configure(text="当前时间")
+            self.next_button.configure(state="disabled")
+            self.range_label.configure(text=f"{rolling_start:%Y-%m-%d %H:%M:%S} →\n"
+                                            f"{rolling_end:%Y-%m-%d %H:%M:%S}  北京时间 UTC+8")
+            self.range_label.pack(fill="x", before=self.summary_card, pady=(0, 7))
+        else:
+            self.range_label.pack_forget()
+        for mode, button in self.range_buttons.items():
+            button.configure(bg=INK if mode == self.range_mode else CARD,
+                             fg=PAPER if mode == self.range_mode else MUTED)
         for mode, button in self.period_buttons.items():
+            button.configure(text={"day": "最近一天", "week": "最近一周", "month": "最近一个月"}[mode]
+                             if recent else {"day": "日", "week": "周", "month": "月"}[mode])
             button.configure(bg=INK if mode == self.period else CARD,
                              fg=PAPER if mode == self.period else MUTED)
-        models = period_models(self.data, self.selected_date, self.period)
+        options = {"recent": recent, "now": instant, "tz": self.reader.tz}
+        models = period_models(self.data, self.selected_date, self.period, **options)
         summary = summarize_day(models, self.pricebook)
         captions = {"day": ("今日", "当日"), "week": ("本周", "当周"), "month": ("本月", "当月")}
-        self.summary_card.set_data(summary, period_output(self.data, self.selected_date, self.period),
-                                   captions[self.period][0 if current else 1])
-        if self.period == "day":
+        self.summary_card.set_data(summary, period_output(self.data, self.selected_date, self.period, **options),
+                                   recent_caption if recent else captions[self.period][0 if current else 1])
+        if self.period == "day" and not recent:
             self.charts.pack_forget()
         else:
-            buckets = period_buckets(self.data, self.selected_date, self.period, tz=self.reader.tz)
+            buckets = period_buckets(self.data, self.selected_date, self.period, **options)
             points = [{**bucket, **summarize_day(bucket["models"], self.pricebook)} for bucket in buckets]
             self.charts.pack(fill="x", before=self.quota_separator)
-            self.charts.set_data(points, self.selected_date, self.period, self.reader.tz)
+            self.charts.set_data(points, self.selected_date, self.period, self.reader.tz,
+                                 recent=recent, now=instant)
         self._render_quota()
         self._render_models(summary)
-        if self._last_scan:
-            self.status_label.configure(text=f"已刷新 {self._last_scan:%H:%M:%S} · 下次 {self._next_refresh_at:%H:%M}")
+        self._render_status()
         warnings = self.data.get("warnings", []) + getattr(self.pricebook, "warnings", [])
         self.warning_label.configure(text=(f"有 {len(warnings)} 条读取提示（点击查看）" if warnings else self._settings_error or ""))
 
@@ -712,9 +842,9 @@ class UsageNote:
             card = tk.Frame(self.models_frame, bg=CARD, padx=12, pady=10)
             card.pack(fill="x", pady=(0, 8))
             card.grid_columnconfigure(0, weight=1)
-            title = self._label(card, row["model"], 11, INK, True, anchor="w", cursor="hand2", justify="left", wraplength=200)
+            title = self._label(card, row["label"], 11, INK, True, anchor="w", cursor="hand2", justify="left", wraplength=200)
             title.grid(row=0, column=0, sticky="w")
-            title.bind("<Button-1>", lambda _e, model=row["model"]: self._edit_prices(model))
+            title.bind("<Button-1>", lambda _e, model=row["base_model"]: self._edit_prices(model))
             cost_text = money(row["quote"].get("total_usd"))
             if row["partial"] and row["known_usd"]:
                 cost_text = money(row["known_usd"]) + " *"
@@ -743,7 +873,8 @@ class UsageNote:
             warnings.insert(0, self._settings_error)
         if getattr(self, "_scan_error", None):
             warnings.insert(0, self._scan_error)
-        messagebox.showinfo("读取提示", "\n\n".join(warnings[:30]) or "当前没有读取提示。", parent=self.root)
+        messagebox.showinfo("读取提示", "\n\n".join(warnings[:29] + [cache_diagnostics(self.data)]),
+                            parent=self.root)
 
     def _show_info(self):
         latest = local_time(self.data.get("latest_event_at"))
@@ -752,20 +883,22 @@ class UsageNote:
             notes = [notes]
         details = "\n\n".join(str(note) for note in notes)
         text = ("统一按北京时间（UTC+8）汇总 Codex 本机历史（含归档），可能包含多个账号留下的记录。日期、曲线、额度快照和重置时间均为北京时间。\n\n"
-                            "日／周／月切换决定汇总范围。自然周从周一开始，每小时一个点；自然月每天一个点。曲线表示各时段的用量，不是累计值。过去无记录时段按 0 计，未来不计入，当前时段尚未结束。\n\n"
+                            "选择自然／最近，再切换日／周／月。自然周从周一开始、自然月从每月 1 日开始；最近一天／一周／一个月分别为截至当前时间的过去 24 小时／7 天／30 天，会记住所选模式。最近模式按日志记录的精确用量／完成事件时间筛选，起点包含、终点不包含，不按任务创建时间或运行时长分摊。点击当前时间重算区间，刷新也会更新。\n\n"
+                            "最近一天／一周每小时一个点；自然周每小时一个点；自然月和最近一个月每天一个点。最近区间首尾时段只统计范围内的记录。曲线表示各时段的用量，不是累计值。过去无记录时段按 0 计，未来不计入，当前时段尚未结束。\n\n"
                             "按你的统计口径，codex-auto-review 不计入 token、金额和模型明细。\n\n"
                             "总 token = 输入 + 缓存读取 + 输出。输入不含缓存读取；缓存写入是输入的子项，不重复累加。推理 token 已包含在输出中。\n\n"
                             "消费／产出卡片默认展示消费，可点击标签、左右箭头或在卡片内左右拖动；选中卡片后也可用键盘左右键。两页共用等高布局，刷新和日期切换保留当前页，重新打开默认回到消费。\n\n"
                             "产出只统计 Codex 自带日志：成功完成的文件修改中，新增与删除行数之和为改动行数（含代码、文档及其他文本），同一文件多次修改会累计行数；修改文件数在所选时段内按路径去重。完成轮次来自完成事件，不等于任务验收通过或合并代码。重复／分叉／归档记录只计一次，排除 codex-auto-review。\n\n"
                             "产出是日志已记录的小计，不是 Git 净增行数。通过终端脚本等方式写入、但没有内置文件修改记录的内容无法计入；没有产出记录的时段显示横线。不会访问 Issue/MR，也不会推测缺失记录。\n\n"
                             "金额按当前已知的标准 API 刊例价估算，单位为美元。它不是 ChatGPT / Codex 订阅实际账单，也不代表额度消耗。\n\n"
-                            "历史日期也按当前价表估算。暂不调整长上下文、Fast / Priority、Batch 等特殊价格；缺少模型价格或缓存写入价时标为待定价，并仅显示已知价小计。可点击模型名称编辑价格与来源。\n\n"
+                            "历史日期也按当前价表估算。Fast / Priority 与 Ultrafast 按模型变体单列，分别按基础模型 Standard 价的 2.5 倍和 8 倍计算，沿用订阅内额度倍率作为展示口径；购买 credits / 企业按量付费的官方倍率分别为 2 倍和 6 倍。这里的美元估算不用于核对实际扣费。长上下文、Batch 等特殊价格不自动调整。缺少模型价格或缓存写入价时标为待定价，并仅显示已知价小计。可点击模型名称编辑价格与来源。\n\n"
                             "账号额度用左右箭头翻页：当前登录账号第一，其余按最早重置时间排序。其他账号保留上次查询快照，登录并成功刷新一次后自动收录。翻页不会切换登录。\n\n"
                             "启动和手动刷新立即读取用量并查询当前账号额度；自动更新在北京时间每小时的 00、05、10……55 分触发。手动刷新不会改变下一次自动更新时间，电脑休眠期间不更新，恢复后补一次并重新对齐钟点。\n\n"
                             "账号额度仅使用 Codex 账号接口结果，每次查询核对账号 ID 与查询前后身份。查询失败保留该账号已有快照及时间；没有快照则显示暂无数据，不用日志额度补全。已到重置时间的旧窗口显示待刷新，不推算剩余额度。Token、费用、曲线和模型明细仍是本机全部日志，与账号额度翻页无关。\n\n"
                             f"最近用量记录：{latest}\n已扫描文件：{self.data.get('files_scanned', 0):,}\n"
+                            f"{cache_diagnostics(self.data)}\n"
                             f"价表核实日期：{getattr(self.pricebook, 'updated_at', '') or '未知'}\n"
-                            "用量日志仅在本机读取，不上传会话。账号额度由本机 Codex 查询官方服务；本地仅保存邮箱、套餐、额度与账号 ID 的哈希，不保存登录凭据。\n\n价表详细说明\n\n" + details)
+                            "用量日志仅在本机读取，不上传会话。历史缓存保存在本机，包含日志文件路径、工作目录、会话与轮次标识、token、产出和额度等统计元数据，不保存会话正文。账号额度由本机 Codex 查询官方服务；账号快照仅保存邮箱、套餐、额度与账号 ID 的哈希，不保存登录凭据。\n\n价表详细说明\n\n" + details)
         dialog = self._dialog("如何理解这张便签", "530x620")
         body = tk.Frame(dialog, bg=PAPER, padx=20, pady=20)
         body.pack(fill="both", expand=True)

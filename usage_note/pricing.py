@@ -1,10 +1,20 @@
-"""Explicit, source-backed standard API rates. No guessed model aliases."""
+"""Standard API rates with Codex included-usage speed multipliers for display."""
 
 from __future__ import annotations
 
 import json
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
+
+from usage_note.models import base_model, model_service_tier
+
+
+CODEX_FAST_MULTIPLIER = Decimal("2.5")
+CODEX_ULTRAFAST_MULTIPLIER = Decimal("8")
+CODEX_SPEED_MULTIPLIERS = {
+    "fast": CODEX_FAST_MULTIPLIER,
+    "ultrafast": CODEX_ULTRAFAST_MULTIPLIER,
+}
 
 
 def _price(value) -> Decimal:
@@ -53,23 +63,27 @@ class PriceBook:
             return {}
 
     def quote(self, model: str, tokens: dict) -> dict:
-        rates = self.models.get(model)
+        standard_model = base_model(model)
+        rates = self.models.get(standard_model)
+        multiplier = CODEX_SPEED_MULTIPLIERS.get(model_service_tier(model), Decimal(1))
         result = dict(input_usd=None, cached_usd=None, output_usd=None,
                       total_usd=None, cache_write_usd=None,
                       cache_write_tokens=max(0, int(tokens.get('cache_write', 0))),
                       known_usd=0.0, input_known_usd=0.0, partial=True, rates=rates,
-                      source=rates.get('source', '') if rates else None)
+                      source=rates.get('source', '') if rates else None,
+                      pricing_multiplier=float(multiplier))
         if rates is None:
             return result
         counts = {key: max(0, int(tokens.get(key, 0))) for key in ('input', 'cached', 'output')}
         writes = min(counts['input'], result['cache_write_tokens'])
         million = Decimal(1_000_000)
-        ordinary_cost = Decimal(counts['input'] - writes) * _price(rates['input']) / million
-        write_cost = (Decimal(writes) * _price(rates['cache_write']) / million
+        ordinary_cost = (Decimal(counts['input'] - writes) * _price(rates['input']) * multiplier
+                          / million)
+        write_cost = (Decimal(writes) * _price(rates['cache_write']) * multiplier / million
                       if rates.get('cache_write') is not None else (Decimal(0) if writes == 0 else None))
         input_cost = ordinary_cost + write_cost if write_cost is not None else None
-        cached_cost = Decimal(counts['cached']) * _price(rates['cached']) / million
-        output_cost = Decimal(counts['output']) * _price(rates['output']) / million
+        cached_cost = Decimal(counts['cached']) * _price(rates['cached']) * multiplier / million
+        output_cost = Decimal(counts['output']) * _price(rates['output']) * multiplier / million
         known = ordinary_cost + (write_cost or Decimal(0)) + cached_cost + output_cost
         result.update(input_usd=float(input_cost) if input_cost is not None else None,
                       cached_usd=float(cached_cost), output_usd=float(output_cost),

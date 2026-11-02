@@ -7,7 +7,7 @@ import math
 import tkinter as tk
 from datetime import timedelta
 
-from usage_note.periods import local_midnight, period_bounds
+from usage_note.periods import local_midnight, period_bounds, recent_bounds
 from usage_note.timebase import BEIJING_TZ
 
 PAPER, INK, MUTED = "#F7F4EC", "#292D2A", "#797C72"
@@ -30,6 +30,7 @@ class UsageCharts(tk.Frame):
         self.money_format = money_format
         self.points = []
         self.mode = "week"
+        self.recent = False
         self._coords = {}
         self.heading = tk.Label(self, bg=PAPER, fg=INK, font=(FONT, 10, "bold"), anchor="w")
         self.heading.pack(fill="x", pady=(12, 1))
@@ -47,15 +48,26 @@ class UsageCharts(tk.Frame):
         self.detail.pack(fill="x", pady=(1, 8))
         tk.Frame(self, bg=LINE, height=1).pack(fill="x", pady=(0, 8))
 
-    def set_data(self, points, anchor, mode, tz=BEIJING_TZ):
+    def set_data(self, points, anchor, mode, tz=BEIJING_TZ, *, recent=False, now=None):
         self.points, self.mode, self.tz = points, mode, tz
-        self.start, self.end = period_bounds(anchor, mode)
-        self.start_at, self.end_at = local_midnight(self.start, tz), local_midnight(self.end, tz)
-        self.heading.configure(text="每小时用量 / 自然周" if mode == "week" else "每天用量 / 自然月")
+        self.recent = recent
+        if recent:
+            self.start_at, self.end_at = recent_bounds(mode, now=now, tz=tz)
+            self.start, self.end = self.start_at.date(), self.end_at.date()
+            caption = {"day": "最近一天", "week": "最近一周", "month": "最近一个月"}[mode]
+        else:
+            self.start, self.end = period_bounds(anchor, mode)
+            self.start_at, self.end_at = local_midnight(self.start, tz), local_midnight(self.end, tz)
+            caption = "自然周" if mode == "week" else "自然月"
+        unit = "天" if mode == "month" else "小时"
+        self.heading.configure(text=f"每{unit}用量 / {caption}")
         self._draw()
         self._clear_hover()
 
     def _fraction(self, at):
+        if self.recent:
+            return ((at.timestamp() - self.start_at.timestamp()) /
+                    max(1, self.end_at.timestamp() - self.start_at.timestamp()))
         if self.mode == "month":
             return (at.date() - self.start).days / max(1, (self.end - self.start).days - 1)
         return ((at.timestamp() - self.start_at.timestamp()) /
@@ -89,14 +101,21 @@ class UsageCharts(tk.Frame):
                 canvas.create_line(left, y, right, y, fill=LINE)
                 label = compact(value) if key == "tokens" else self.money_format(value)
                 canvas.create_text(left - 7, y, text=label, fill=MUTED, anchor="e", font=(FONT, 7))
-            if self.mode == "week":
+            if self.recent:
+                duration = self.end_at - self.start_at
+                ticks = [(self.start_at + duration * i / 4,
+                          (self.start_at + duration * i / 4).strftime(
+                              "%H:%M" if self.mode == "day" else "%m/%d")) for i in range(5)]
+            elif self.mode == "week":
                 ticks = [(self.start + timedelta(days=i), "一二三四五六日"[i]) for i in range(7)]
             else:
                 last = (self.end - self.start).days
                 ticks = [(self.start + timedelta(days=d - 1), str(d)) for d in (1, 8, 15, 22, last)]
-            for day, label in ticks:
-                x = left + self._fraction(local_midnight(day, self.tz)) * (right - left)
-                canvas.create_text(x, bottom + 16, text=label, fill=MUTED, font=(FONT, 7))
+            for index, (day, label) in enumerate(ticks):
+                at = day if self.recent else local_midnight(day, self.tz)
+                x = left + self._fraction(at) * (right - left)
+                anchor = ("w" if index == 0 else "e" if index == len(ticks) - 1 else "center") if self.recent else "center"
+                canvas.create_text(x, bottom + 16, text=label, fill=MUTED, anchor=anchor, font=(FONT, 7))
             coords = [(left + self._fraction(p["at"]) * (right - left),
                        bottom - p[key] / ceiling * (bottom - top)) for p in self.points]
             self._coords[key] = coords
@@ -115,7 +134,7 @@ class UsageCharts(tk.Frame):
                 if self.mode == "month" or len(coords) == 1 or (key == "known_usd" and not self.points[index]["fully_priced"]):
                     canvas.create_oval(x - 2, y - 2, x + 2, y + 2, outline=color,
                                        fill=PAPER if key == "known_usd" and not self.points[index]["fully_priced"] else color)
-            if coords and self.points[-1]["current"] and right - coords[-1][0] > 62:
+            if not self.recent and coords and self.points[-1]["current"] and right - coords[-1][0] > 62:
                 canvas.create_text((coords[-1][0] + right) / 2, (top + bottom) / 2,
                                    text="尚未发生", fill=MUTED, font=(FONT, 8))
 
@@ -140,7 +159,11 @@ class UsageCharts(tk.Frame):
             canvas.create_oval(px - 3, py - 3, px + 3, py + 3, fill=PAPER, outline=color,
                                width=2, tags="hover")
         at, end = point["at"], point["end"]
-        if self.mode == "week":
+        if self.recent:
+            label = f"{at:%m-%d %H:%M:%S}–{end:%m-%d %H:%M:%S} UTC+8"
+            if index == len(self.points) - 1:
+                label += " · 截至当前时间"
+        elif self.mode == "week":
             offset = at.strftime("%z")
             label = f"{at:%m-%d %H:%M}–{end:%H:%M}  UTC{offset[:3]}:{offset[3:]}"
         else:
@@ -155,10 +178,11 @@ class UsageCharts(tk.Frame):
     def _clear_hover(self):
         for canvas in self.plots.values():
             canvas.delete("hover")
-        unit = "小时" if self.mode == "week" else "天"
+        unit = "天" if self.mode == "month" else "小时"
         text = f"悬停查看每{unit}数值 · 已过时段无记录按 0 计"
         if self.points and self.points[-1]["current"]:
-            text += "\n当前时段尚未结束，随记录自动更新"
+            text += ("\n末段仅计截至当前时间的记录" if self.recent else
+                     "\n当前时段尚未结束，随记录自动更新")
         else:
             text += "\n费用按当前刊例价估算"
         self.detail.configure(text=text, fg=MUTED)

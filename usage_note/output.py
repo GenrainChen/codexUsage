@@ -5,7 +5,8 @@ from datetime import datetime
 import hashlib
 import ntpath
 
-from usage_note.periods import period_bounds
+from usage_note.periods import period_bounds, recent_bounds
+from usage_note.timebase import BEIJING_TZ
 
 
 @dataclass(frozen=True)
@@ -73,28 +74,37 @@ def output_event(payload, at, turn_id, cwd):
     return OutputEvent(at, ("file", item["id"]), added, deleted, frozenset(files))
 
 
-def output_days(events, tz):
-    days = {}
+def output_views(events, tz):
+    """Build daily and precise views from one chronological deduplication pass."""
+    days, instants = {}, {}
     seen = set()
     for event in sorted(events, key=lambda event: event.at):
         if event.key in seen:
             continue
         seen.add(event.key)
-        key = event.at.astimezone(tz).date().isoformat()
-        row = days.setdefault(key, {"added": 0, "deleted": 0, "files": set(), "turns": 0})
-        row["added"] += event.added
-        row["deleted"] += event.deleted
-        row["files"].update(event.files)
-        row["turns"] += event.turns
-    return {day: {**row, "files": sorted(row["files"])} for day, row in sorted(days.items())}
+        at = event.at.astimezone(tz)
+        for view, key in ((days, at.date().isoformat()), (instants, at.isoformat())):
+            row = view.setdefault(key, {"added": 0, "deleted": 0, "files": set(), "turns": 0})
+            row["added"] += event.added
+            row["deleted"] += event.deleted
+            row["files"].update(event.files)
+            row["turns"] += event.turns
+    return tuple({key: {**row, "files": sorted(row["files"])} for key, row in sorted(view.items())}
+                 for view in (days, instants))
 
 
-def period_output(data, selected, mode):
-    start, end = (bound.isoformat() for bound in period_bounds(selected, mode))
+def output_days(events, tz):
+    return output_views(events, tz)[0]
+
+
+def period_output(data, selected, mode, *, recent=False, now=None, tz=BEIJING_TZ):
+    start, end = (recent_bounds(mode, now=now, tz=tz) if recent else
+                  tuple(bound.isoformat() for bound in period_bounds(selected, mode)))
     result = {"added": 0, "deleted": 0, "files": 0, "turns": 0, "recorded": False}
     files = set()
-    for day, row in data.get("output_days", {}).items():
-        if start <= day < end:
+    for key, row in data.get("output_instants" if recent else "output_days", {}).items():
+        at = datetime.fromisoformat(key) if recent else key
+        if start <= at < end:
             result["recorded"] = True
             for key in ("added", "deleted", "turns"):
                 result[key] += row[key]
